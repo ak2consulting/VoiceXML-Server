@@ -5,7 +5,7 @@ package VoiceXML::Server;
 use diagnostics;
 use strict;
 
-($VoiceXML::Server::VERSION) = '$Revision: 1.6 $ ' =~ /\$Revision:\s+([^\s]+)/;
+($VoiceXML::Server::VERSION) = '$Revision: 1.13 $ ' =~ /\$Revision:\s+([^\s]+)/;
 
 sub _silliness {
     my $zz;
@@ -131,6 +131,8 @@ use HTTP::Status;
 use LWP::UserAgent;
 use POSIX 'setsid';
 
+use Carp;
+
 sub CheckArgs {
     my $ref = shift;
     my %ok;
@@ -139,7 +141,7 @@ sub CheckArgs {
     }
     foreach my $k (keys %$ref) {
         if (!$ok{$k}) {
-            die "Illegal parameter $k";
+            confess "Illegal parameter $k";
         }
     }
 }
@@ -179,6 +181,11 @@ will continue to try and use a higher port number, but will turn on
 the avoidfirewall behavior.  So, you can just punch a few ports
 through your firewall, and have things work even if those get filled up.
 
+=item timeoutinterval
+
+How many seconds to wait in a listen() before deciding that the user
+has hung up and will not be coming back.  Default value is 60.
+
 =item debug
 
 If you set debug to 1, then files will be created in /tmp containing
@@ -201,10 +208,12 @@ sub new {
     $theserver = $self;
 
     my %args = @_;
-    CheckArgs(\%args, ('minport', 'maxport', 'avoidfirewall', 'debug'));
+    CheckArgs(\%args, ('minport', 'maxport', 'avoidfirewall', 'debug',
+                       'timeoutinterval', 'servername'));
 
     $self->{'outstr'} = [];
     $self->{'mode'} = "cmdline";
+    $self->{'timeoutinterval'} = $args{'timeoutinterval'} || 60;
     if ($args{'debug'}) {
         $self->{'debug'} = 1;
         my $me = $0;
@@ -225,7 +234,8 @@ sub new {
 
     if ($ENV{'SERVER_NAME'} && $ENV{'SCRIPT_NAME'}) {
         $self->{'mode'} = "vxml";
-        $self->{'origurl'} = "http://$ENV{'SERVER_NAME'}$ENV{'SCRIPT_NAME'}";
+        my $server = $args{'servername'} || $ENV{'SERVER_NAME'};
+        $self->{'origurl'} = "http://$server$ENV{'SCRIPT_NAME'}";
     }
 
     my $minport = $args{'minport'} || 7500;
@@ -314,27 +324,49 @@ Content-type: text/vxml
 
 sub DoProxyStuff ( $$ ) {
     my ($port, $args) = @_;
-    my $url = "http://localhost:$port/?$args";
-    my $ua = LWP::UserAgent->new;
-    my $request = HTTP::Request->new('GET', $url);
-    my $buffer = "";
-    my $response = $ua->request($request, sub {$buffer .= shift});
-    print "Cache-Control: no-cache\n";
-    print "Content-type: text/vxml\n\n";
-    if ($response->is_error) {
-        my $str = $response->message();
-        print "<vxml><form><block><audio>$str</audio></block></form></vxml>\n";
+    if ($args =~ /vxmllib.recordvalue/) {
+        my $url = "http://localhost:$port/?$args";
+        my $ua = LWP::UserAgent->new;
+        my $request = HTTP::Request->new('POST', $url);
+        my $count = 0;
+        while (<>) {
+            $request->add_content($_);
+            $count++;
+        }
+        my $buffer = "";
+        my $response = $ua->request($request, sub {$buffer .= shift});
+        print "Cache-Control: no-cache\n";
+        print "Content-type: text/vxml\n\n";
+        if ($response->is_error) {
+            my $str = $response->message();
+            print "<vxml><form><block><audio>$str</audio></block></form></vxml>\n";
+        } else {
+            print $buffer;
+        }
+        exit;
     } else {
-        print $buffer;
+        my $url = "http://localhost:$port/?$args";
+        my $ua = LWP::UserAgent->new;
+        my $request = HTTP::Request->new('GET', $url);
+        my $buffer = "";
+        my $response = $ua->request($request, sub {$buffer .= shift});
+        print "Cache-Control: no-cache\n";
+        print "Content-type: text/vxml\n\n";
+        if ($response->is_error) {
+            my $str = $response->message();
+            print "<vxml><form><block><audio>$str</audio></block></form></vxml>\n";
+        } else {
+            print $buffer;
+        }
+        exit;
     }
-    exit;
 }
 
     
 sub _waitForConnection {
     my $self = shift;
     delete $self->{'connection'};
-    alarm(60);
+    alarm($self->{'timeoutinterval'});
     while (!$self->{'connection'}) {
         $self->{'connection'} = $self->{'daemon'}->accept();
     }
@@ -344,6 +376,10 @@ sub _waitForConnection {
 sub _MakeAbsoluteURL {
     my $self = shift;
     my ($url) = @_;
+
+    if ($url eq "_home") {
+        return $url;            # Special case.
+    }
     
     $url =~ s/^['"](.*)["']$/$1/; # Strip surrounding quotes.
 
@@ -407,6 +443,22 @@ value, and the second as a C<tts> value.
 sub Audio
 {
     my $self = shift;
+    if (ref($_[0]) eq "ARRAY") {
+        $self->Audio(@{$_[0]});
+        shift @_;
+        if (@_) {
+            $self->Audio(@_);
+        }
+        return;
+    }
+    if (ref($_[0]) eq "HASH") {
+        $self->Audio(%{$_[0]});
+        shift @_;
+        if (@_) {
+            $self->Audio(@_);
+        }
+        return;
+    }
     if (1 == @_) {
         @_ = ('tts' => $_[0]);
     } elsif (2 == @_ && $_[0] =~ /\.wav$/) {
@@ -414,15 +466,24 @@ sub Audio
               'tts' => $_[1]);
     }
     my %args = @_;
-    CheckArgs(\%args, ('tts', 'wav', 'data'));
+    CheckArgs(\%args, ('tts', 'wav', 'data', 'pause'));
     my $wav = $args{'wav'};
     my $tts = $args{'tts'};
     my $data = $args{'data'};
-    if (!$wav && !$tts && !$data) {
-        die "Must specify at least one of 'wav' or 'tts' to Audio";
+    my $pause = $args{'pause'};
+    if (!$wav && !$tts && !$data && !$pause) {
+        confess
+            "Must specify at least one of 'wav', 'tts', or 'pause' to Audio";
     }
     if ($wav && $data) {
-        die "Can't specify both 'wav' and 'data'.";
+        confess "Can't specify both 'wav' and 'data'.";
+    }
+    if ($pause) {
+        if ($wav || $tts || $data) {
+            confess "Can't specify both 'pause' and audio data";
+        }
+        $self->Pause(milliseconds => $pause);
+        return;
     }
     if ($self->{'mode'} eq 'cmdline') {
         my $msg = $tts || $wav || $data;
@@ -472,7 +533,7 @@ sub Pause
 
 
 =item $server->Listen(grammar => $grammar, [nomatch => $nomatchstr], 
-[noinput => $noinputstr], [timeout => $seconds]);
+[noinput => $noinputstr], [timeout => $seconds], [bargein => boolean]);
 
 The C<Listen> method will wait for the user to say something, and
 return that value.
@@ -517,6 +578,15 @@ C<timeout> specifies how many seconds to wait before generating a
 noinput event.  If you do not specify one, a platform default value is
 used.
 
+=item bargein => boolean
+
+C<bargein> specifies whether the user is allowed to "barge in" and 
+respond to the prompts before the audio has finished playing.   Default
+is on.  If turned off, then all the audio since the last call to
+C<Listen> will be played without interruption.
+
+
+
 =back
 
 =cut
@@ -530,10 +600,14 @@ sub Listen
     my %args = @_;
 
     CheckArgs(\%args, ('grammar', 'grammarsrc', 'noinput', 'nomatch',
-                       'timeout'));
+                       'timeout', 'bargein'));
 
     my $grammar = $args{'grammar'};
     my $grammarsrc = $args{'grammarsrc'};
+    my $bargein = $args{'bargein'};
+    if (!defined $bargein) {
+        $bargein = 1;
+    }
 
     if ((!$grammar && !$grammarsrc) || ($grammar && $grammarsrc)) {
         die "Must specify exactly one of 'grammar' and 'grammarsrc' to Listen()";
@@ -591,6 +665,11 @@ sub Listen
     }
 
 
+    my $bargeinpart = "";
+    if (!$bargein) {
+        $bargeinpart = qq{ bargein="false"};
+    }
+
     print $conn qq{<?xml version="1.0"?>
 <!DOCTYPE vxml PUBLIC "-//Tellme Networks//Voice Markup Language 1.0//EN"
 "http://resources.tellme.com/toolbox/vxml-tellme.dtd">
@@ -598,7 +677,7 @@ sub Listen
 <vxml application="http://resources.tellme.com/lib/universals.vxml">
 
 <form id="top">
-<field id="session.vxmllib.result"$timeoutpart>
+<field name="session.vxmllib.result"$timeoutpart$bargeinpart>
 $outtext
 $grammar
 <noinput>
@@ -643,6 +722,216 @@ $nomatch
 }
 
 
+sub _VXMLifyList {
+    my ($self, $tag, $list) = @_;
+    my $result = "";
+    foreach my $item (@$list) {
+        $self->{'outstr'} = [];
+        $self->Audio($item);
+        $result .= "<$tag>" . join("\n", @{$self->{'outstr'}}) .
+            "<reprompt/></$tag>";
+    }
+    return $result;
+}
+        
+
+
+sub Record
+{
+    my $self = shift;
+    my %args = @_;
+
+    CheckArgs(\%args, ('donerecordingaudio', 'grammar', 'nullaudioword',
+                       'replayword', 'replaypreaudio', 'replaypostaudio',
+                       'helpword', 'helpaudio', 'nomatch', 'noinput',
+                       'maxtime', 'finalsilence'));
+
+    my $donerecordingaudio =
+        $args{'donerecordingaudio'} ||
+        {wav => "http://resources.tellme.com/audio/earcons/beep_end.wav"};
+    my $grammar = $args{'grammar'} || die "Missing required 'grammar' parameter";
+    my $nullaudioword = $args{'nullaudioword'} || "";
+    my $replayword = $args{'replayword'} || "";
+    my $replaypreaudio = $args{'replaypreaudio'} || [];
+    my $replaypostaudio = $args{'replaypostaudio'} || [];
+    my $helpword = $args{'helpword'} || "";
+    my $helpaudio = $args{'helpaudio'} || [];
+    my $nomatch =
+        $args{'nomatch'} || {tts => "I'm sorry, I didn't get that."};
+    my $noinput =
+        $args{'noinput'} || {tts => "I'm sorry, I didn't hear anything."};
+    if (ref($nomatch) ne "ARRAY") {
+        $nomatch = [ $nomatch ];
+    }
+    if (ref($noinput) ne "ARRAY") {
+        $noinput = [ $nomatch ];
+    }
+    my $maxtime = $args{'maxtime'} || 30;
+    my $finalsilence = $args{'finalsilence'} || 2;
+    
+
+    my $id = "session.vxmllib.recordvalue";
+  
+    if ($self->{'mode'} eq 'cmdline') {
+        my $result = <STDIN>;
+        if (!defined $result) {
+            exit();
+        }
+        chomp($result);
+        return ("insertsoundhere", $result);
+    }
+
+    my $conn = $self->{'connection'};
+    $conn->send_basic_header();
+    print $conn "Content-type: text/vxml";
+    $conn->send_crlf();
+    $conn->send_crlf();
+    my $myurl = escapeHTML($self->{'myurl'});
+
+    my $outtext = "";
+    if (@{$self->{'outstr'}}) {
+        $outtext = "<prompt>" . join("\n", @{$self->{'outstr'}}) . "</prompt>";
+    }
+
+    $self->{'outstr'} = [];
+    $self->Audio($donerecordingaudio);
+    $donerecordingaudio = join("\n", @{$self->{'outstr'}});
+
+    $self->{'outstr'} = [];
+    $self->Audio($replaypreaudio);
+    $replaypreaudio = join("\n", @{$self->{'outstr'}});
+
+    $self->{'outstr'} = [];
+    $self->Audio($replaypostaudio);
+    $replaypostaudio = join("\n", @{$self->{'outstr'}});
+
+    $self->{'outstr'} = [];
+    $self->Audio($helpaudio);
+    $helpaudio = join("\n", @{$self->{'outstr'}});
+
+    $noinput = $self->_VXMLifyList("noinput", $noinput);
+    $nomatch = $self->_VXMLifyList("nomatch", $nomatch);
+
+
+    $self->{'outstr'} = [];
+
+    print $conn qq{<?xml version="1.0"?>
+<!DOCTYPE vxml PUBLIC "-//Tellme Networks//Voice Markup Language 1.0//EN"
+"http://resources.tellme.com/toolbox/vxml-tellme.dtd">
+
+<vxml application="http://resources.tellme.com/lib/universals.vxml">
+
+    <form id="RecordTest">
+        <record name="$id" dtmfterm="true" finalsilence="$finalsilence" maxtime="$maxtime">
+            $outtext
+            <filled>
+                $donerecordingaudio
+            </filled>
+            <noinput>
+                <goto next="#Abort"/>
+            </noinput>
+            <default>
+                <goto next="#Abort"/>
+            </default>
+        </record>
+        <field name="session.vxmllib.result">
+            <prompt>
+            </prompt>
+            <grammar><![CDATA[$grammar]]></grammar>
+            $nomatch
+            $noinput
+            <filled>
+                <result name="$replayword">
+                    $replaypreaudio
+                    <audio data="{$id}"/>
+                    $replaypostaudio
+                    <reprompt/>
+                </result>
+                <result name="$nullaudioword">
+                    <goto next="${myurl}result=${nullaudioword}&amp;"/>
+                </result>
+                <result name="$helpword">
+                    $helpaudio
+                    <reprompt/>
+                </result>
+                <submit next="${myurl}result={session.vxmllib.result}&amp;" method="post" namelist="$id" />
+            </filled>
+            <default>
+                <reprompt/>
+            </default>
+        </field>
+    </form>
+    <form id="Abort">
+        <block>
+            <goto next="${myurl}result=0&amp;"/>
+        </block>
+    </form>
+</vxml>
+
+};
+
+    
+ Log("Closing connection");
+    while (1) {
+        $self->{'connection'}->close();
+        delete $self->{'connection'};
+        Log("Waiting for new connection");
+        $self->_waitForConnection();
+        Log("Getting recording from new connection");
+
+        $self->{'outstr'} = [];
+
+        while (my $r = $self->{'connection'}->get_request()) {
+            if ($r->url->query =~ /result=([^&]*)\&/) {
+                my $result = $1;
+                chomp($result);
+                Log("Got result code $result");
+                if (!$result) {
+                    return (undef, undef);
+                }
+                if ($result eq $nullaudioword) {
+                    return (undef, $result);
+                }
+                my @list = split(/\n/, $r->content());
+                my $audio = "";
+                my $boundary = shift @list;
+                chomp($boundary);
+                $boundary =~ s/\s*$//;
+                Log("Found audio boundary line: $boundary");
+                while (@list) {
+                    $_ = shift @list;
+                    if (/^\s+$/) {
+                        last;
+                    }
+                    Log("Ignoring audio header line: $_");
+                }
+                while (@list) {
+                    $_ = shift @list;
+                    if ($_ =~ /^$boundary/) {
+                        last;
+                    }
+                    # Log("Appending audio line: $_");
+                    $audio .= $_ . "\n";
+                }
+                Log("Ignoring remaining audio data lines: " .
+                    join("\n", @list));
+                return ($audio, $result);
+            } else {
+                Log("Invalid request <" . $r->url->query . ">" . $r->as_string());
+                $self->{'connection'}->send_error(RC_FORBIDDEN);
+                exit();
+            }
+        } 
+        Log("Connection went away without getting anything from it.");
+    }
+}
+    
+
+
+    
+
+
+
 =item $server->GoToURL(url)
 
 C<GoToURL> is used to exit your application.  It specifies a URL of
@@ -684,6 +973,45 @@ sub GoToURL
 }
 
 
+=item $server->Disconnect()
+
+C<Disconnect> is used to exit your application.  It causes the system to hang
+up on the caller.
+
+=cut
+
+
+sub Disconnect
+{
+    my $self = shift;
+
+    if ($self->{'mode'} eq 'cmdline') {
+        print "Disconnecting\n";
+        exit;
+    }
+    my $conn = $self->{'connection'};
+    $conn->send_basic_header();
+    print $conn "Content-type: text/vxml";
+    $conn->send_crlf();
+    $conn->send_crlf();
+
+
+    my $outtext = join("\n", @{$self->{'outstr'}});
+    print $conn qq{<?xml version="1.0" ?>
+<vxml>
+ <form>
+  <block>
+   $outtext
+   <disconnect/>
+  </block>
+ </form>
+</vxml>
+};
+    $conn->close();
+    exit;
+}
+
+
 sub Log
 {
     if (!$theserver->{'debug'}) {
@@ -712,6 +1040,28 @@ sub DieLog
 =head1 CHANGE LOG
 
  * $Log: Server.pm,v $
+ * Revision 1.13  2001/04/30 17:48:44  weissman
+ * Added a 'bargein' parameter to Listen().
+ *
+ * Revision 1.12  2000/11/15 21:15:59  weissman
+ * Added the Disconnect() method.
+ *
+ * Revision 1.11  2000/11/14 19:18:51  weissman
+ * Make Record() and avoidfirewall work with each other.
+ *
+ * Revision 1.10  2000/11/14 17:42:17  weissman
+ * Added timeoutinterval parameter.
+ *
+ * Revision 1.9  2000/11/08 16:58:54  weissman
+ * Added maxtime and finalsilence parameters to the (still very
+ * experimental) Record() routine.
+ *
+ * Revision 1.8  2000/11/07 23:49:35  weissman
+ * Added initial, likely-to-be-changed support for the <record> tag.
+ *
+ * Revision 1.7  2000/10/05 17:11:02  weissman
+ * Added copyright text.
+ *
  * Revision 1.6  2000/10/03 22:07:08  weissman
  * Fixed minor typo.
  *
@@ -737,3 +1087,8 @@ sub DieLog
 Terry Weissman <weissman@tellme.com>
 
 Web page: http://studio.tellme.com/downloads/VoiceXML-Server/
+
+=head1 COPYRIGHT
+
+(C)2000 Tellme Networks, Inc. See
+http://studio.tellme.com/open_license.html
